@@ -8,6 +8,7 @@ export const USER_NAME_KEY = 'userName';
 export const USER_EMAIL_KEY = 'userEmail';
 
 const API_PORT = 5001;
+const PRODUCTION_API_URL = 'https://medigo-backend-f5tx.onrender.com';
 
 function isPrivateLanHost(host: string): boolean {
   return (
@@ -46,9 +47,7 @@ function expoDevHost(): string | null {
 /**
  * Resolve the MediGo API base URL.
  * - Prefer EXPO_PUBLIC_API_URL when set to a reachable host
- * - If env points at localhost but Expo is on a LAN IP (physical device),
- *   rewrite to that LAN IP so the phone can reach your Mac
- * - Fall back to Expo host / emulator loopback / localhost
+ * - Otherwise default to the live Render backend URL
  */
 function resolveApiBaseUrl(): string {
   const lanHost = expoDevHost();
@@ -75,16 +74,7 @@ function resolveApiBaseUrl(): string {
     return fromEnv;
   }
 
-  if (lanHost) {
-    return `http://${lanHost}:${API_PORT}`;
-  }
-
-  // Android emulator reaches the host machine via 10.0.2.2
-  if (Platform.OS === 'android') {
-    return `http://10.0.2.2:${API_PORT}`;
-  }
-
-  return `http://localhost:${API_PORT}`;
+  return PRODUCTION_API_URL;
 }
 
 export const API_BASE_URL = resolveApiBaseUrl();
