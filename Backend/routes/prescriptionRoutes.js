@@ -10,14 +10,24 @@ const router = express.Router();
 // Multer configured inline (memoryStorage — no separate utils file)
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 8 * 1024 * 1024 },
+  limits: { fileSize: 12 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
-    if (!file.mimetype.startsWith('image/')) {
-      return cb(new Error('Only image uploads are allowed'));
+    const mime = String(file.mimetype || '').toLowerCase();
+    if (mime.startsWith('image/') || mime === 'application/octet-stream' || !mime) {
+      return cb(null, true);
     }
-    cb(null, true);
+    return cb(new Error('Only image uploads are allowed'));
   },
 });
+
+function receiveImage(req, res, next) {
+  upload.single('image')(req, res, (err) => {
+    if (err) {
+      return res.status(400).json({ message: err.message || 'Unable to upload image' });
+    }
+    next();
+  });
+}
 
 const UPLOAD_DIR = path.join(__dirname, '..', 'uploads', 'prescriptions');
 
@@ -34,96 +44,211 @@ function saveImageBuffer(file) {
   return `/uploads/prescriptions/${filename}`;
 }
 
+const SKIP_LINE =
+  /^(rx|prescription|take|as directed|sig|patient|age|sex|date|address|phone|diagnosis|advice|follow|morning|night|after|before|food|tablet|capsule|syrup|dose|qty|quantity|refill)\b/i;
+
+function cleanMedicineName(name) {
+  return String(name || '')
+    .replace(/^(?:\d+[.)]\s*|[-•*]+\s*)/, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
 function parseMedicinesFromText(text) {
   const medicines = [];
+  const seen = new Set();
   const lines = String(text || '')
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean);
 
   for (const line of lines) {
-    // e.g. "1. Metformin 500 mg" or "Paracetamol - 650mg"
-    const match =
-      /^(?:\d+[.)]\s*)?([A-Za-z][A-Za-z0-9\s/-]{1,40}?)\s*[-:]?\s*(\d+(?:\.\d+)?\s*(?:mg|mcg|g|ml|IU|units?)?)/i.exec(
+    if (SKIP_LINE.test(line) || line.length < 3) {
+      continue;
+    }
+
+    // e.g. "1. Metformin 500 mg" / "2 Atorvastatin 10mg" / "Paracetamol - 650mg"
+    let match =
+      /^(?:\d+[.)]?\s+|[-•*]+\s*)?([A-Za-z][A-Za-z0-9./-]{1,40}(?:\s+[A-Za-z][A-Za-z0-9./-]{0,20}){0,3}?)\s*[-:]?\s*(\d+(?:\.\d+)?\s*(?:mg|mcg|g|ml|IU|units?))\b/i.exec(
         line,
       );
 
+    // e.g. "Tab. Azithromycin" / "Cap Amoxicillin"
+    if (!match) {
+      match =
+        /^(?:Tab(?:let)?s?\.?|Cap(?:sule)?s?\.?|Syp\.?|Inj\.?)\s+([A-Za-z][A-Za-z0-9\s/-]{1,40})/i.exec(
+          line,
+        );
+      if (match) {
+        const dosageMatch =
+          /(\d+(?:\.\d+)?\s*(?:mg|mcg|g|ml|IU|units?))\b/i.exec(line);
+        match = [match[0], match[1], dosageMatch ? dosageMatch[1] : ''];
+      }
+    }
+
     if (match) {
-      medicines.push({
-        name: match[1].trim(),
-        dosage: match[2].trim(),
-      });
+      const name = cleanMedicineName(match[1]);
+      const dosage = String(match[2] || '').trim();
+      const key = `${name.toLowerCase()}|${dosage.toLowerCase()}`;
+      if (!name || seen.has(key) || name.length < 2) {
+        continue;
+      }
+      seen.add(key);
+      medicines.push({ name, dosage });
     }
   }
 
   return medicines;
 }
 
+function normalizePersonName(raw) {
+  const cleaned = String(raw || '')
+    .replace(/[^A-Za-z.\s'-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!cleaned) {
+    return '';
+  }
+  // Reject OCR junk / old demo placeholder
+  if (/^(unknown|unkown|name|doctor|dr)$/i.test(cleaned)) {
+    return '';
+  }
+  return cleaned
+    .split(' ')
+    .filter(Boolean)
+    .map((part) => {
+      if (/^(md|ms|mrs|mr|dr)\.?$/i.test(part)) {
+        return part.replace(/\.$/, '').toUpperCase() === 'DR' ? 'Dr.' : part;
+      }
+      return part.charAt(0).toUpperCase() + part.slice(1).toLowerCase();
+    })
+    .join(' ');
+}
+
 function parseDoctorName(text) {
-  const match = /(?:Dr\.?|Doctor)\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)/.exec(
-    text || '',
+  const raw = String(text || '').replace(/\r/g, '');
+  const patterns = [
+    // Dr. / DR / Doctor / Or. (common OCR misread of Dr.)
+    /(?:^|\n)\s*(?:Dr|DR|Doctor|Or)\.?\s*[:.-]?\s*([A-Za-z][A-Za-z.'-]{1,30}(?:[ \t]+[A-Za-z][A-Za-z.']{1,30}){0,3})/,
+    // Physician / Consultant / Prescribed by
+    /(?:Physician|Consultant|Prescribed\s+by|Seen\s+by|Examined\s+by)\s*[:.-]?\s*(?:Dr\.?\s*)?([A-Za-z][A-Za-z.'-]{1,30}(?:[ \t]+[A-Za-z][A-Za-z.']{1,30}){0,3})/i,
+    // "Dr Name" anywhere on a short letterhead line
+    /\b(?:Dr|Doctor)\.?\s+([A-Za-z][A-Za-z.'-]{1,30}(?:[ \t]+[A-Za-z][A-Za-z.']{1,30}){0,2})\b/,
+  ];
+
+  for (const pattern of patterns) {
+    const match = pattern.exec(raw);
+    if (!match) {
+      continue;
+    }
+    const name = normalizePersonName(match[1]);
+    if (!name) {
+      continue;
+    }
+    return name.toLowerCase().startsWith('dr') ? name : `Dr. ${name}`;
+  }
+
+  return '';
+}
+
+function emptyOcrResult(extractedText = '') {
+  return {
+    extractedText,
+    doctorName: parseDoctorName(extractedText),
+    extractedMedicines: parseMedicinesFromText(extractedText),
+  };
+}
+
+const OCR_LANG_DIR = path.join(__dirname, '..', 'ocr-data');
+
+async function runLocalTesseract(file) {
+  const { createWorker } = require('tesseract.js');
+  const hasLocalLang = fs.existsSync(path.join(OCR_LANG_DIR, 'eng.traineddata'));
+  const worker = await createWorker(
+    'eng',
+    1,
+    hasLocalLang
+      ? { langPath: OCR_LANG_DIR, cachePath: OCR_LANG_DIR, gzip: false }
+      : undefined,
   );
-  return match ? `Dr. ${match[1]}` : '';
+  try {
+    const {
+      data: { text },
+    } = await worker.recognize(file.buffer);
+    return String(text || '').trim();
+  } finally {
+    await worker.terminate().catch(() => {});
+  }
+}
+
+async function runOcrSpace(file, apiKey) {
+  const mime = file.mimetype || 'image/jpeg';
+  const base64 = `data:${mime};base64,${file.buffer.toString('base64')}`;
+  const form = new FormData();
+  form.append('base64Image', base64);
+  form.append('language', 'eng');
+  form.append('isOverlayRequired', 'false');
+  form.append('OCREngine', '2');
+  form.append('scale', 'true');
+
+  const response = await fetch('https://api.ocr.space/parse/image', {
+    method: 'POST',
+    headers: { apikey: apiKey },
+    body: form,
+  });
+
+  if (!response.ok) {
+    throw new Error(`OCR service error (${response.status})`);
+  }
+
+  const data = await response.json();
+  if (data.IsErroredOnProcessing) {
+    throw new Error(
+      (Array.isArray(data.ErrorMessage) ? data.ErrorMessage[0] : data.ErrorMessage) ||
+        'OCR processing failed',
+    );
+  }
+
+  return (data.ParsedResults || [])
+    .map((item) => item.ParsedText || '')
+    .join('\n')
+    .trim();
 }
 
 /**
- * OCR call written directly in this routes file (no utils helper).
- * Uses OCR.space when OCR_API_KEY is set; otherwise returns a structured fallback.
+ * Local Tesseract first (bundled eng.traineddata), then OCR.space if configured.
+ * Never invent sample medicines like Paracetamol / Amoxicillin.
  */
 async function runOcrOnBuffer(file) {
-  const apiKey = process.env.OCR_API_KEY;
+  let extractedText = '';
+  let source = 'none';
 
-  if (apiKey) {
-    const form = new FormData();
-    form.append('apikey', apiKey);
-    form.append('language', 'eng');
-    form.append('isOverlayRequired', 'false');
-    form.append(
-      'file',
-      new Blob([file.buffer], { type: file.mimetype || 'image/jpeg' }),
-      file.originalname || 'prescription.jpg',
-    );
-
-    const response = await fetch('https://api.ocr.space/parse/image', {
-      method: 'POST',
-      body: form,
-    });
-
-    if (!response.ok) {
-      throw new Error(`OCR service error (${response.status})`);
+  try {
+    extractedText = await runLocalTesseract(file);
+    if (extractedText) {
+      source = 'tesseract';
     }
-
-    const data = await response.json();
-    if (data.IsErroredOnProcessing) {
-      throw new Error(data.ErrorMessage?.[0] || 'OCR processing failed');
-    }
-
-    const extractedText = (data.ParsedResults || [])
-      .map((item) => item.ParsedText || '')
-      .join('\n')
-      .trim();
-
-    return {
-      extractedText,
-      doctorName: parseDoctorName(extractedText) || 'Dr. Unknown',
-      extractedMedicines: parseMedicinesFromText(extractedText),
-    };
+  } catch (err) {
+    console.warn('Local OCR failed:', err.message);
   }
 
-  // Offline / no API key — still return a usable OCR-shaped result
-  const extractedText = [
-    'Dr. Unknown',
-    'Rx',
-    '1. Paracetamol 500 mg',
-    '2. Amoxicillin 250 mg',
-    'Take as directed',
-  ].join('\n');
+  const apiKey = process.env.OCR_API_KEY;
+  if (!extractedText && apiKey) {
+    try {
+      extractedText = await runOcrSpace(file, apiKey);
+      if (extractedText) {
+        source = 'ocr.space';
+      }
+    } catch (err) {
+      console.warn('OCR.space failed:', err.message);
+    }
+  }
 
-  return {
-    extractedText,
-    doctorName: 'Dr. Unknown',
-    extractedMedicines: parseMedicinesFromText(extractedText),
-  };
+  const result = emptyOcrResult(extractedText);
+  console.log(
+    `[prescription-ocr] source=${source} textChars=${extractedText.length} medicines=${result.extractedMedicines.length}`,
+  );
+  return result;
 }
 
 function toPrescriptionDto(doc) {
@@ -132,7 +257,9 @@ function toPrescriptionDto(doc) {
   return {
     id: String(obj._id),
     imageUrl: obj.imageUrl,
-    doctorName: obj.doctorName || '',
+    doctorName: /unknown/i.test(String(obj.doctorName || ''))
+      ? ''
+      : obj.doctorName || '',
     uploadedAt: uploaded.toISOString(),
     dateIssued: obj.dateIssued
       ? new Date(obj.dateIssued).toISOString().slice(0, 10)
@@ -171,7 +298,7 @@ router.get('/', protect, async (req, res) => {
 });
 
 // POST /api/prescriptions/upload — multer + OCR + save
-router.post('/upload', protect, upload.single('image'), async (req, res) => {
+router.post('/upload', protect, receiveImage, async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ message: 'image file is required' });
@@ -180,18 +307,21 @@ router.post('/upload', protect, upload.single('image'), async (req, res) => {
     const ocr = await runOcrOnBuffer(req.file);
     const imageUrl = saveImageBuffer(req.file);
 
-    const doctorName =
+    const rawDoctor =
       (req.body.doctorName && String(req.body.doctorName).trim()) ||
       ocr.doctorName ||
       '';
+    const doctorName = /unknown/i.test(rawDoctor) ? '' : rawDoctor;
 
     const bodyMedicines = parseMedicinesField(req.body.medicines);
     const extractedMedicines =
       bodyMedicines.length > 0
-        ? bodyMedicines.map((item) => ({
-            name: item.name || '',
-            dosage: item.dosage || '',
-          }))
+        ? bodyMedicines
+            .map((item) => ({
+              name: String(item.name || '').trim(),
+              dosage: String(item.dosage || '').trim(),
+            }))
+            .filter((item) => item.name)
         : ocr.extractedMedicines;
 
     const prescription = await Prescription.create({
@@ -207,14 +337,19 @@ router.post('/upload', protect, upload.single('image'), async (req, res) => {
     res.status(201).json({
       ...toPrescriptionDto(prescription),
       extractedText: ocr.extractedText,
+      ocrNote:
+        ocr.extractedMedicines.length === 0
+          ? 'No medicines detected clearly. Add them manually.'
+          : undefined,
     });
   } catch (err) {
+    console.error('[prescription-upload]', err);
     res.status(500).json({ message: err.message || 'Upload / OCR failed' });
   }
 });
 
 // POST /api/prescriptions/ocr — OCR only (used by the mobile extract step)
-router.post('/ocr', protect, upload.single('image'), async (req, res) => {
+router.post('/ocr', protect, receiveImage, async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ message: 'image file is required' });
@@ -236,7 +371,7 @@ router.post('/ocr', protect, upload.single('image'), async (req, res) => {
 });
 
 // POST /api/prescriptions — save after client-side edit (image + fields)
-router.post('/', protect, upload.single('image'), async (req, res) => {
+router.post('/', protect, receiveImage, async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ message: 'image file is required' });
@@ -261,6 +396,44 @@ router.post('/', protect, upload.single('image'), async (req, res) => {
     res.status(201).json(toPrescriptionDto(prescription));
   } catch (err) {
     res.status(500).json({ message: err.message || 'Unable to save prescription' });
+  }
+});
+
+// PATCH /api/prescriptions/:id — update doctor name / medicines after OCR review
+router.patch('/:id', protect, async (req, res) => {
+  try {
+    const prescription = await Prescription.findOne({
+      _id: req.params.id,
+      user: req.user._id,
+    });
+
+    if (!prescription) {
+      return res.status(404).json({ message: 'Prescription not found' });
+    }
+
+    if (req.body.doctorName !== undefined) {
+      const nextName = String(req.body.doctorName || '').trim();
+      prescription.doctorName = /unknown/i.test(nextName) ? '' : nextName;
+    }
+
+    if (req.body.medicines !== undefined) {
+      const medicines = parseMedicinesField(req.body.medicines)
+        .map((item) => ({
+          name: String(item.name || '').trim(),
+          dosage: String(item.dosage || '').trim(),
+        }))
+        .filter((item) => item.name);
+      prescription.extractedMedicines = medicines;
+    }
+
+    if (req.body.extractedText !== undefined) {
+      prescription.extractedText = String(req.body.extractedText || '');
+    }
+
+    await prescription.save();
+    res.json(toPrescriptionDto(prescription));
+  } catch (err) {
+    res.status(500).json({ message: err.message || 'Unable to update prescription' });
   }
 });
 

@@ -25,10 +25,15 @@ export default function PrescriptionUploadScreen() {
   const insets = useSafeAreaInsets();
 
   const [imageUri, setImageUri] = useState<string | null>(null);
+  const [pickedAsset, setPickedAsset] = useState<ImagePicker.ImagePickerAsset | null>(
+    null,
+  );
   const [doctorName, setDoctorName] = useState('');
   const [medicines, setMedicines] = useState<ExtractedMedicine[]>([]);
   const [uploadedId, setUploadedId] = useState<string | null>(null);
   const [isExtracting, setIsExtracting] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const [extractedText, setExtractedText] = useState('');
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -37,9 +42,10 @@ export default function PrescriptionUploadScreen() {
       if (!result || !('assets' in result) || !result.assets?.length) {
         return;
       }
-      const uri = result.assets[0]?.uri;
-      if (uri) {
-        setImageUri(uri);
+      const asset = result.assets[0];
+      if (asset?.uri) {
+        setImageUri(asset.uri);
+        setPickedAsset(asset);
         setMedicines([]);
         setUploadedId(null);
       }
@@ -50,6 +56,7 @@ export default function PrescriptionUploadScreen() {
     setMedicines([]);
     setUploadedId(null);
     setDoctorName('');
+    setExtractedText('');
   };
 
   const pickFromCamera = async () => {
@@ -65,12 +72,15 @@ export default function PrescriptionUploadScreen() {
 
     const result = await ImagePicker.launchCameraAsync({
       mediaTypes: ['images'],
-      quality: 0.8,
+      quality: 0.7,
       allowsEditing: true,
+      preferredAssetRepresentationMode:
+        ImagePicker.UIImagePickerPreferredAssetRepresentationMode.Compatible,
     });
 
     if (!result.canceled && result.assets[0]?.uri) {
       setImageUri(result.assets[0].uri);
+      setPickedAsset(result.assets[0]);
       resetExtraction();
     }
   };
@@ -88,12 +98,15 @@ export default function PrescriptionUploadScreen() {
 
     const result = await ImagePicker.launchImageLibraryAsync({
       mediaTypes: ['images'],
-      quality: 0.8,
+      quality: 0.7,
       allowsEditing: true,
+      preferredAssetRepresentationMode:
+        ImagePicker.UIImagePickerPreferredAssetRepresentationMode.Compatible,
     });
 
     if (!result.canceled && result.assets[0]?.uri) {
       setImageUri(result.assets[0].uri);
+      setPickedAsset(result.assets[0]);
       resetExtraction();
     }
   };
@@ -107,14 +120,23 @@ export default function PrescriptionUploadScreen() {
     setError(null);
 
     try {
-      const saved = await prescriptionService.upload(imageUri);
+      const saved = await prescriptionService.upload(imageUri, {
+        mimeType: pickedAsset?.mimeType ?? null,
+        fileName: pickedAsset?.fileName ?? null,
+      });
       setUploadedId(saved.id);
       setMedicines(saved.medicines);
       setDoctorName(saved.doctorName || '');
-    } catch {
+      setExtractedText(saved.extractedText || saved.notes || '');
+    } catch (err) {
       setUploadedId(null);
       setMedicines([]);
-      setError('Upload / OCR failed. Please try again.');
+      setExtractedText('');
+      setError(
+        err instanceof Error && err.message
+          ? err.message
+          : 'Upload / OCR failed. Please try again.',
+      );
     } finally {
       setIsExtracting(false);
     }
@@ -141,14 +163,30 @@ export default function PrescriptionUploadScreen() {
     ]);
   };
 
-  const handleSave = () => {
+  const handleSave = async () => {
     if (!uploadedId) {
       setError('Extract text first to save this prescription.');
       return;
     }
 
-    // Upload endpoint already persisted the prescription + OCR result.
-    router.replace('/prescriptions' as Href);
+    setIsSaving(true);
+    setError(null);
+    try {
+      await prescriptionService.update(uploadedId, {
+        doctorName: doctorName.trim(),
+        medicines: medicines.filter((item) => item.name.trim()),
+        extractedText,
+      });
+      router.replace('/prescriptions' as Href);
+    } catch (err) {
+      setError(
+        err instanceof Error && err.message
+          ? err.message
+          : 'Unable to save prescription. Please try again.',
+      );
+    } finally {
+      setIsSaving(false);
+    }
   };
 
   return (
@@ -228,9 +266,16 @@ export default function PrescriptionUploadScreen() {
               label="Doctor Name"
               value={doctorName}
               onChangeText={setDoctorName}
-              placeholder="Dr. Smith"
+              placeholder="Type doctor name if not detected"
               editable={Boolean(uploadedId)}
             />
+
+            {uploadedId && extractedText ? (
+              <View style={styles.ocrPreview}>
+                <Text style={styles.sectionLabel}>OCR text</Text>
+                <Text style={styles.ocrText}>{extractedText}</Text>
+              </View>
+            ) : null}
 
             <View style={styles.listHeader}>
               <Text style={styles.sectionLabel}>Extracted Medicines</Text>
@@ -243,11 +288,13 @@ export default function PrescriptionUploadScreen() {
 
             {!uploadedId ? (
               <Text style={styles.hintText}>
-                Run Extract Text to upload the image and populate medicines from OCR.
+                Run Extract Text to read medicines from this photo. The first scan
+                may take a little longer.
               </Text>
             ) : medicines.length === 0 ? (
               <Text style={styles.hintText}>
-                No medicines were detected. Add them manually if needed.
+                No medicines were detected clearly. Use + Add to enter them
+                manually.
               </Text>
             ) : (
               medicines.map((item) => (
@@ -276,15 +323,19 @@ export default function PrescriptionUploadScreen() {
             {error ? <Text style={styles.errorText}>{error}</Text> : null}
 
             <Pressable
-              onPress={handleSave}
-              disabled={!uploadedId}
+              onPress={() => void handleSave()}
+              disabled={!uploadedId || isSaving}
               style={({ pressed }) => [
                 styles.saveButton,
-                pressed && uploadedId ? styles.pressed : null,
-                !uploadedId ? styles.disabled : null,
+                pressed && uploadedId && !isSaving ? styles.pressed : null,
+                !uploadedId || isSaving ? styles.disabled : null,
               ]}
             >
-              <Text style={styles.saveText}>Save Prescription</Text>
+              {isSaving ? (
+                <ActivityIndicator color={Colors.white} />
+              ) : (
+                <Text style={styles.saveText}>Save Prescription</Text>
+              )}
             </Pressable>
           </View>
         </ScrollView>
@@ -425,6 +476,19 @@ const styles = StyleSheet.create({
     fontSize: 13,
     color: Colors.textSecondary,
     lineHeight: 19,
+  },
+  ocrPreview: {
+    gap: 6,
+    backgroundColor: Colors.inputBackground,
+    borderRadius: 12,
+    padding: 12,
+    borderWidth: 1,
+    borderColor: Colors.border,
+  },
+  ocrText: {
+    fontSize: 12,
+    lineHeight: 18,
+    color: Colors.textSecondary,
   },
   medicineRow: {
     flexDirection: 'row',

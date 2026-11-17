@@ -11,6 +11,7 @@ export type Prescription = {
   uploadedAt: string;
   medicines: ExtractedMedicine[];
   notes?: string;
+  extractedText?: string;
 };
 
 export type PrescriptionOcrResult = {

@@ -1,9 +1,10 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { API_BASE_URL, AUTH_TOKEN_KEY } from '@/constants/config';
+import { normalizeStoredToken } from '@/services/authSession';
 import type { ExtractedMedicine, Prescription } from '@/types/prescription';
 
 async function authHeaders(json = true): Promise<HeadersInit> {
-  const token = await AsyncStorage.getItem(AUTH_TOKEN_KEY);
+  const token = normalizeStoredToken(await AsyncStorage.getItem(AUTH_TOKEN_KEY));
   return {
     Accept: 'application/json',
     ...(json ? { 'Content-Type': 'application/json' } : {}),
@@ -52,6 +53,7 @@ function normalizePrescription(raw: Record<string, unknown>): Prescription {
       ? raw.extractedMedicines
       : [];
 
+  const extractedText = raw.extractedText != null ? String(raw.extractedText) : '';
   return {
     id: String(raw.id ?? raw._id ?? ''),
     imageUrl: resolveImageUrl(String(raw.imageUrl ?? '')),
@@ -62,21 +64,87 @@ function normalizePrescription(raw: Record<string, unknown>): Prescription {
     medicines: medicinesRaw.map((item, index) =>
       normalizeMedicine(item as Record<string, unknown>, index),
     ),
-    notes: raw.notes ? String(raw.notes) : undefined,
+    notes: raw.notes ? String(raw.notes) : extractedText || undefined,
+    extractedText: extractedText || undefined,
   };
 }
 
-function appendImageToFormData(formData: FormData, imageUri: string): void {
-  const filename = imageUri.split('/').pop() ?? 'prescription.jpg';
-  const match = /\.(\w+)$/.exec(filename);
-  const ext = match?.[1]?.toLowerCase() ?? 'jpg';
-  const type = ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' : `image/${ext}`;
+function imageMeta(imageUri: string, options?: { mimeType?: string | null; fileName?: string | null }) {
+  const rawName =
+    options?.fileName || imageUri.split('/').pop()?.split('?')[0] || 'prescription.jpg';
+  const match = /\.(\w+)$/.exec(rawName);
+  const ext = (match?.[1] ?? 'jpg').toLowerCase();
+  const mimeType =
+    options?.mimeType && options.mimeType.startsWith('image/')
+      ? options.mimeType
+      : ext === 'png'
+        ? 'image/png'
+        : 'image/jpeg';
+  const filename = rawName.includes('.')
+    ? rawName
+    : `prescription.${ext === 'png' ? 'png' : 'jpg'}`;
+  return { filename, mimeType };
+}
 
-  formData.append('image', {
-    uri: imageUri,
-    name: filename.includes('.') ? filename : `prescription.${ext}`,
-    type,
-  } as unknown as Blob);
+async function buildImageFormData(
+  imageUri: string,
+  options?: { mimeType?: string | null; fileName?: string | null },
+): Promise<FormData> {
+  const { filename, mimeType } = imageMeta(imageUri, options);
+  const formData = new FormData();
+
+  try {
+    const fileResponse = await fetch(imageUri);
+    const blob = await fileResponse.blob();
+    const typedBlob =
+      blob.type && blob.type.startsWith('image/')
+        ? blob
+        : blob.slice(0, blob.size, mimeType);
+    formData.append('image', typedBlob, filename);
+  } catch {
+    formData.append('image', {
+      uri: imageUri,
+      name: filename,
+      type: mimeType,
+    } as unknown as Blob);
+  }
+
+  return formData;
+}
+
+async function postMultipart(
+  url: string,
+  formData: FormData,
+): Promise<{ status: number; bodyText: string }> {
+  const token = normalizeStoredToken(await AsyncStorage.getItem(AUTH_TOKEN_KEY));
+  const headers: Record<string, string> = {
+    Accept: 'application/json',
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+  };
+
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: formData,
+    });
+    return { status: response.status, bodyText: await response.text() };
+  } catch {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', url);
+      xhr.setRequestHeader('Accept', 'application/json');
+      if (token) {
+        xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+      }
+      xhr.timeout = 60000;
+      xhr.onload = () =>
+        resolve({ status: xhr.status, bodyText: String(xhr.responseText || '') });
+      xhr.onerror = () => reject(new TypeError('Network request failed'));
+      xhr.ontimeout = () => reject(new TypeError('Network request failed'));
+      xhr.send(formData);
+    });
+  }
 }
 
 export const prescriptionService = {
@@ -114,18 +182,62 @@ export const prescriptionService = {
   /**
    * Upload image to /api/prescriptions/upload — runs OCR and persists the prescription.
    */
-  async upload(imageUri: string): Promise<Prescription> {
-    const formData = new FormData();
-    appendImageToFormData(formData, imageUri);
+  async upload(
+    imageUri: string,
+    options?: { mimeType?: string | null; fileName?: string | null },
+  ): Promise<Prescription> {
+    const formData = await buildImageFormData(imageUri, options);
+    const url = `${API_BASE_URL}/api/prescriptions/upload`;
 
-    const response = await fetch(`${API_BASE_URL}/api/prescriptions/upload`, {
-      method: 'POST',
-      headers: await authHeaders(false),
-      body: formData,
+    let status = 0;
+    let bodyText = '';
+    try {
+      const result = await postMultipart(url, formData);
+      status = result.status;
+      bodyText = result.bodyText;
+    } catch {
+      throw new Error('Unable to reach the server. Please try again.');
+    }
+
+    let body: Record<string, unknown> = {};
+    try {
+      body = JSON.parse(bodyText) as Record<string, unknown>;
+    } catch {
+      body = {};
+    }
+
+    if (status < 200 || status >= 300) {
+      throw new Error(
+        String(body.message ?? body.error ?? 'Unable to upload prescription.'),
+      );
+    }
+
+    return normalizePrescription(body);
+  },
+
+  async update(
+    id: string,
+    input: {
+      doctorName?: string;
+      medicines?: ExtractedMedicine[];
+      extractedText?: string;
+    },
+  ): Promise<Prescription> {
+    const response = await fetch(`${API_BASE_URL}/api/prescriptions/${id}`, {
+      method: 'PATCH',
+      headers: await authHeaders(),
+      body: JSON.stringify({
+        doctorName: input.doctorName,
+        medicines: input.medicines?.map((item) => ({
+          name: item.name,
+          dosage: item.dosage,
+        })),
+        extractedText: input.extractedText,
+      }),
     });
 
     if (!response.ok) {
-      throw new Error(await readErrorMessage(response, 'Unable to upload prescription.'));
+      throw new Error(await readErrorMessage(response, 'Unable to update prescription.'));
     }
 
     return normalizePrescription((await response.json()) as Record<string, unknown>);
